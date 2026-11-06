@@ -1,0 +1,6 @@
+services:
+  crosshair-bot:
+    build: .
+    image: cs2-crosshair-bot:latest
+    restart: unless-stopped
+    env_file: .env

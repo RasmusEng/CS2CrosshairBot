@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.png
+.venv/
+.github/
+tests/
+.pytest_cache/
+.ruff_cache/
+*.zip
+bot.log
