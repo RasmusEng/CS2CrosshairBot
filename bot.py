@@ -20,8 +20,9 @@ MAX_CODES_PER_MESSAGE = 3
 
 def build_reply(code: str) -> tuple[discord.Embed, discord.File]:
     ch = crosshair.decode(code)
-    png = crosshair.render_card(ch)
-    file = discord.File(io.BytesIO(png), filename="crosshair.png")
+    data, ext = crosshair.render_card(ch)
+    filename = f"crosshair.{ext}"
+    file = discord.File(io.BytesIO(data), filename=filename)
     embed = discord.Embed(
         title=ch.style_name,
         description=f"`{ch.code}`",

@@ -55,7 +55,8 @@ The package is private when first published. To let anyone pull it, go to GitHub
 
 - The decoding follows the `cs2-v1` layout in [akiver/csgo-sharecode](https://github.com/akiver/csgo-sharecode). Old `CSGO-xxxxx-…` codes aren't supported, because CS2 rejects them too.
 - Length, gap and thickness are pixels at the code's screen height. The preview draws them on a pixel grid, scaled up.
-- Static and dynamic cross styles and dot-only render accurately. Dynamic styles are drawn at rest. Circle and quad styles, plus the *half* outline, are approximations.
+- Static cross styles and dot-only render accurately. Circle and quad styles, plus the *half* outline, are approximations.
+- Moving crosshairs are sent as animated GIFs: the dynamic styles (cross, circle, legacy cross, quad) spread and recover, and *Static Cross (Shot Feedback)* kicks on each shot. The movement approximates CS2's, and the spread is capped so the crosshair stays readable. Other styles are sent as PNGs.
 
 ## Development
 

@@ -144,77 +144,126 @@ def decode(code: str) -> Crosshair:
 # ---------------------------------------------------------------------------
 
 Rect = tuple[int, int, int, int]  # x0, y0, x1, y1 (exclusive end)
+Piece = tuple[Rect, float]  # rectangle and alpha multiplier
+
+CROSS_STYLES = {0, 2, 4, 5}
+QUAD_STYLES = {7, 8, 9}
+CIRCLE_STYLES = {1, 3}
+# Styles that spread when moving/shooting, and the static cross that kicks on each shot.
+DYNAMIC_STYLES = {0, 1, 2, 7}
+SHOT_FEEDBACK_STYLE = 5
+
+FRAME_MS = 60
 
 
-def _shapes(ch: Crosshair, c: int) -> list[Rect]:
+def is_animated(ch: Crosshair) -> bool:
+    return ch.style in DYNAMIC_STYLES or ch.style == SHOT_FEEDBACK_STYLE
+
+
+def _max_spread(ch: Crosshair) -> int:
+    """How far (native px) the pieces travel at the peak of the animation."""
+    if ch.style in DYNAMIC_STYLES:
+        # Capped so a large spread limit does not shrink the crosshair to a speck in the preview.
+        return max(2, min(ch.dynamic_spread_limit, ch.length * 2 + 6, 24))
+    if ch.style == SHOT_FEEDBACK_STYLE:
+        return max(2, min(ch.length // 2 + 1, 6))
+    return 0
+
+
+def _spread_timeline(ch: Crosshair) -> list[float]:
+    """Spread per frame, 0 = at rest, 1 = full spread."""
+    if ch.style == SHOT_FEEDBACK_STYLE:
+        shot = [1.0, 0.5, 0.0, 0.0]
+        return [0.0] * 6 + shot * 3 + [0.0] * 6
+    expand = [1 - (1 - i / 5) ** 2 for i in range(1, 6)]  # ease out
+    contract = [(1 - i / 10) ** 2 for i in range(1, 11)]  # ease in
+    return [0.0] * 6 + expand + [1.0] * 8 + contract
+
+
+def _native_size(ch: Crosshair) -> int:
+    reach = abs(ch.gap) + ch.length + ch.thickness + _max_spread(ch) + 4
+    return max(2 * reach + 9, 24)
+
+
+def _pieces(ch: Crosshair, c: int, spread: int) -> list[Piece]:
     """Filled rectangles of the crosshair in native screen pixels, centred on pixel c."""
     t = max(ch.thickness, 1)
     # The centre block spans [lo, hi); arms start `gap` pixels outside it.
     lo = c - t // 2
     hi = lo + t
     g, L = ch.gap, ch.length
-    rects: list[Rect] = []
+    pieces: list[Piece] = []
 
-    if ch.style in (0, 2, 4, 5) and L > 0:  # cross styles (dynamic ones drawn at rest)
-        rects.append((lo - g - L, lo, lo - g, hi))  # left
-        rects.append((hi + g, lo, hi + g + L, hi))  # right
-        rects.append((lo, hi + g, hi, hi + g + L))  # bottom
+    def arms(start: int, n: int, alpha: float) -> None:
+        pieces.append(((lo - start - n, lo, lo - start, hi), alpha))  # left
+        pieces.append(((hi + start, lo, hi + start + n, hi), alpha))  # right
+        pieces.append(((lo, hi + start, hi, hi + start + n), alpha))  # bottom
         if not ch.t_style:
-            rects.append((lo, lo - g - L, hi, lo - g))  # top
-    elif ch.style in (7, 8, 9) and L > 0:  # quad / square: four corner brackets
+            pieces.append(((lo, lo - start - n, hi, lo - start), alpha))  # top
+
+    if ch.style in CROSS_STYLES and L > 0:
+        if ch.style == 0 and spread:
+            # Dynamic cross splits each arm: the inner part moves at most split_distance, the outer
+            # part (split_size_ratio of the length) moves with the full spread. Both fade to their split alpha.
+            outer_len = round(L * ch.split_size_ratio)
+            inner_len = L - outer_len
+            fade = min(1.0, spread / max(ch.split_distance, 1))
+            if inner_len:
+                arms(g + min(spread, ch.split_distance), inner_len, 1 + (ch.inner_split_alpha - 1) * fade)
+            if outer_len:
+                arms(g + inner_len + spread, outer_len, 1 + (ch.outer_split_alpha - 1) * fade)
+        else:
+            arms(g + spread, L, 1.0)
+    elif ch.style in QUAD_STYLES and L > 0:  # quad / square: four corner brackets
         def bar(xa: int, xb: int, ya: int, yb: int) -> Rect:
             return (min(xa, xb), min(ya, yb), max(xa, xb), max(ya, yb))
 
-        r = t // 2 + g + L
+        r = t // 2 + g + L + spread
         for sx in (-1, 1):
             for sy in (-1, 1):
                 # Outer corner of the bracket; legs run inwards from it.
                 x, y = c + (sx > 0) + sx * r, c + (sy > 0) + sy * r
-                rects.append(bar(x, x - sx * L, y, y - sy * t))
-                rects.append(bar(x, x - sx * t, y, y - sy * L))
+                pieces.append((bar(x, x - sx * L, y, y - sy * t), 1.0))
+                pieces.append((bar(x, x - sx * t, y, y - sy * L), 1.0))
 
     if ch.center_dot or ch.style == 6:
-        rects.append((lo, lo, hi, hi))
-    return rects
+        pieces.append(((lo, lo, hi, hi), 1.0))
+    return pieces
 
 
-def _circle_radius(ch: Crosshair) -> int:
-    return max(ch.thickness, 1) // 2 + ch.gap + ch.length
+def _with_alpha(color: tuple[int, int, int, int], mult: float) -> tuple[int, int, int, int]:
+    return (*color[:3], round(color[3] * max(0.0, min(mult, 1.0))))
 
 
-def render(ch: Crosshair, scale: int = 8, tile: int = 0) -> Image.Image:
-    """Render the crosshair on a dark background, upscaled with nearest-neighbour so pixels stay crisp."""
-    reach = max(abs(ch.gap) + ch.length + ch.thickness + 4, 8)
-    size = tile or (2 * reach + 9)
-    size = max(size, 24)
+def render(ch: Crosshair, scale: int = 8, spread: int = 0, size: int = 0) -> Image.Image:
+    """Render the crosshair on a grey background, upscaled with nearest-neighbour so pixels stay crisp."""
+    size = size or _native_size(ch)
     c = size // 2
 
-    bg = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     outline = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     fill = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     od, fd = ImageDraw.Draw(outline), ImageDraw.Draw(fill)
 
-    rects = _shapes(ch, c)
-    circle = ch.style in (1, 3)
+    pieces = _pieces(ch, c, spread)
+    circle = ch.style in CIRCLE_STYLES
+    t = max(ch.thickness, 1)
+    r = t // 2 + ch.gap + ch.length + spread
 
     if ch.outline_mode:
         # Full outline = 1px on every side; half outline = 1px on the right and bottom only.
         pad = (1, 1, 1, 1) if ch.outline_mode == 1 else (0, 0, 1, 1)
-        for x0, y0, x1, y1 in rects:
-            od.rectangle((x0 - pad[0], y0 - pad[1], x1 - 1 + pad[2], y1 - 1 + pad[3]), fill=ch.outline_color)
+        for (x0, y0, x1, y1), a in pieces:
+            od.rectangle((x0 - pad[0], y0 - pad[1], x1 - 1 + pad[2], y1 - 1 + pad[3]),
+                         fill=_with_alpha(ch.outline_color, a))
         if circle:
-            r = _circle_radius(ch)
-            od.ellipse((c - r - 1, c - r - 1, c + r + 1, c + r + 1), outline=ch.outline_color,
-                       width=max(ch.thickness, 1) + 2)
+            od.ellipse((c - r - 1, c - r - 1, c + r + 1, c + r + 1), outline=ch.outline_color, width=t + 2)
 
-    for x0, y0, x1, y1 in rects:
-        fd.rectangle((x0, y0, x1 - 1, y1 - 1), fill=ch.color)
+    for (x0, y0, x1, y1), a in pieces:
+        fd.rectangle((x0, y0, x1 - 1, y1 - 1), fill=_with_alpha(ch.color, a))
     if circle:
-        r = _circle_radius(ch)
-        fd.ellipse((c - r, c - r, c + r, c + r), outline=ch.color, width=max(ch.thickness, 1))
+        fd.ellipse((c - r, c - r, c + r, c + r), outline=ch.color, width=t)
 
-    img = Image.alpha_composite(bg, outline)
-    img = Image.alpha_composite(img, fill)
+    img = Image.alpha_composite(outline, fill)
     img = img.resize((size * scale, size * scale), Image.NEAREST)
 
     # Background: a neutral grey gradient so both dark and light crosshairs are visible.
@@ -224,19 +273,9 @@ def render(ch: Crosshair, scale: int = 8, tile: int = 0) -> Image.Image:
     return Image.alpha_composite(back, img)
 
 
-def render_card(ch: Crosshair) -> bytes:
-    """Crosshair preview plus a settings panel, as PNG bytes."""
-    preview_px = 384
-    reach = max(abs(ch.gap) + ch.length + ch.thickness + 4, 8)
-    native = max(2 * reach + 9, 24)
-    scale = max(1, preview_px // native)
-    preview = render(ch, scale=scale)
-    if preview.width != preview_px:
-        preview = preview.resize((preview_px, preview_px), Image.NEAREST)
-
+def _panel(ch: Crosshair, preview_px: int, scale: int) -> Image.Image:
     panel_w = 360
     card = Image.new("RGBA", (preview_px + panel_w, preview_px), (24, 26, 30, 255))
-    card.paste(preview, (0, 0))
     d = ImageDraw.Draw(card)
     title = ImageFont.load_default(size=22)
     body = ImageFont.load_default(size=16)
@@ -264,9 +303,41 @@ def render_card(ch: Crosshair) -> bytes:
     # Colour swatch next to the title.
     d.rectangle((preview_px + panel_w - 50, 20, preview_px + panel_w - 22, 44),
                 fill=(ch.red, ch.green, ch.blue, 255), outline=(255, 255, 255))
-    d.text((x, preview_px - 30), f"Preview at {scale}x, 1 block = 1 px at {ch.screen_height}p",
-           font=ImageFont.load_default(size=12), fill=(120, 125, 135))
+    footer = f"Preview at {scale}x, 1 block = 1 px at {ch.screen_height}p"
+    if is_animated(ch):
+        footer += "\nAnimation approximates in-game movement"
+    d.multiline_text((x, preview_px - 44), footer, font=ImageFont.load_default(size=12), fill=(120, 125, 135),
+                     spacing=4)
+    return card
+
+
+def render_card(ch: Crosshair) -> tuple[bytes, str]:
+    """Crosshair preview plus a settings panel. Returns (image bytes, "gif" or "png")."""
+    preview_px = 384
+    native = _native_size(ch)
+    scale = max(1, preview_px // native)
+    panel = _panel(ch, preview_px, scale)
+
+    def frame(spread: int) -> Image.Image:
+        preview = render(ch, scale=scale, spread=spread, size=native)
+        if preview.width != preview_px:
+            preview = preview.resize((preview_px, preview_px), Image.NEAREST)
+        card = panel.copy()
+        card.paste(preview, (0, 0))
+        return card.convert("RGB")
 
     buf = io.BytesIO()
-    card.convert("RGB").save(buf, "PNG")
-    return buf.getvalue()
+    if not is_animated(ch):
+        frame(0).save(buf, "PNG")
+        return buf.getvalue(), "png"
+
+    peak = _max_spread(ch)
+    cache: dict[int, Image.Image] = {}
+    frames = []
+    for f in _spread_timeline(ch):
+        s = round(f * peak)
+        if s not in cache:
+            cache[s] = frame(s)
+        frames.append(cache[s])
+    frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], duration=FRAME_MS, loop=0)
+    return buf.getvalue(), "gif"
